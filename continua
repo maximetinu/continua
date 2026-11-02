@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+"""continua: type a message + Enter into a specific Ghostty tab at a set time.
+
+Built for "you hit your usage limit, try again at 15:45" moments with Codex,
+Claude Code or any other terminal agent: pick the tab, enter the time, leave it
+running. When the time comes, it focuses that tab, types "continue" and presses
+Enter. Close it and nothing happens.
+
+Usage:
+  continua                          interactive wizard
+  continua --list                   list Ghostty terminals
+  continua -t codex --at 15:45
+  continua -t <id> --in 2h13m --text "continue"
+  continua -t <id> --test           fire now and exit
+
+It uses Ghostty's AppleScript dictionary (tested on Ghostty 1.4.0): the terminal is
+addressed by its stable id, focused with `focus`, and the text is sent straight
+to that surface (`input text` + `send key "enter"`). So it still lands in the
+right tab if focusing fails or the screen is locked. `--mode keystroke` sends
+real key events through System Events instead (needs Accessibility permission)
+and only types after it confirms the right terminal has focus.
+
+While it waits, `caffeinate` keeps the Mac awake. Quit (q or Ctrl+C) cancels.
+
+https://github.com/maximetinu/continua · WTFPL
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import os
+import re
+import select
+import subprocess
+import sys
+import termios
+import time
+import tty
+
+__version__ = "0.1.0"
+
+SEP = "\x1f"
+DEFAULT_TEXT = os.environ.get("CONTINUA_TEXT", "continue")
+
+# ── colors ───────────────────────────────────────────────────────────────────
+TTY = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def c(code: str, s: str) -> str:
+    return f"\033[{code}m{s}\033[0m" if TTY else s
+
+
+def bold(s: str) -> str:
+    return c("1", s)
+
+
+def dim(s: str) -> str:
+    return c("2", s)
+
+
+def green(s: str) -> str:
+    return c("32", s)
+
+
+def yellow(s: str) -> str:
+    return c("33", s)
+
+
+def red(s: str) -> str:
+    return c("31", s)
+
+
+def cyan(s: str) -> str:
+    return c("36", s)
+
+
+# ── AppleScript ──────────────────────────────────────────────────────────────
+LIST_SCRIPT = r"""
+set sep to character id 31
+set out to ""
+tell application "Ghostty"
+  set wi to 0
+  repeat with w in windows
+    set wi to wi + 1
+    try
+      repeat with t in tabs of w
+        try
+          repeat with s in terminals of t
+            try
+              set out to out & wi & sep & (index of t) & sep & (selected of t) & sep & (id of s) & sep & (pid of s) & sep & (tty of s) & sep & (working directory of s) & sep & (name of s) & linefeed
+            end try
+          end repeat
+        end try
+      end repeat
+    end try
+  end repeat
+end tell
+return out
+"""
+
+FOCUS_SCRIPT = r"""
+on run argv
+  set tid to item 1 of argv
+  tell application "Ghostty"
+    activate
+    focus (terminal id tid)
+  end tell
+end run
+"""
+
+CHECK_FOCUS_SCRIPT = r"""
+tell application "Ghostty"
+  set fr to frontmost
+  set ft to ""
+  try
+    set ft to id of (focused terminal of (selected tab of front window))
+  end try
+  return (fr as text) & (character id 31) & ft
+end tell
+"""
+
+PASTE_SCRIPT = r"""
+on run argv
+  set tid to item 1 of argv
+  set txt to item 2 of argv
+  set ms to (item 3 of argv) as integer
+  tell application "Ghostty"
+    set t to terminal id tid
+    if txt is not "" then input text txt to t
+    delay (ms / 1000)
+    send key "enter" to t
+  end tell
+end run
+"""
+
+KEYSTROKE_SCRIPT = r"""
+on run argv
+  set txt to item 1 of argv
+  set ms to (item 2 of argv) as integer
+  tell application "System Events"
+    if txt is not "" then keystroke txt
+    delay (ms / 1000)
+    key code 36
+  end tell
+end run
+"""
+
+
+def osa(script: str, *args: str, timeout: float = 15) -> str:
+    r = subprocess.run(
+        ["osascript", "-e", script, *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or f"osascript exited with {r.returncode}")
+    return r.stdout.rstrip("\n")
+
+
+# ── terminals ────────────────────────────────────────────────────────────────
+class Term:
+    def __init__(self, row: list[str]):
+        self.win, self.tab, sel, self.id, pid, self.tty, self.cwd, self.name = row
+        self.selected = sel == "true"
+        self.pid = int(pid) if pid.isdigit() else 0
+        self.proc = proc_name(self.pid)
+
+    def label(self) -> str:
+        home = os.path.expanduser("~")
+        cwd = "~" + self.cwd[len(home):] if self.cwd.startswith(home) else self.cwd
+        return f"w{self.win} tab {self.tab:<2} {self.proc:<10} {cwd}  {dim(self.name[:60])}"
+
+
+def proc_name(pid: int) -> str:
+    if not pid:
+        return "?"
+    try:
+        out = subprocess.run(["ps", "-o", "comm=", "-p", str(pid)], capture_output=True, text=True).stdout
+        return os.path.basename(out.strip()) or "?"
+    except Exception:
+        return "?"
+
+
+def list_terms() -> list[Term]:
+    out = ""
+    for attempt in range(3):  # a tab can close while we list
+        try:
+            out = osa(LIST_SCRIPT)
+            break
+        except RuntimeError:
+            if attempt == 2:
+                raise
+            time.sleep(0.3)
+    terms = []
+    for line in out.splitlines():
+        row = line.split(SEP)
+        if len(row) == 8:
+            terms.append(Term(row))
+    return terms
+
+
+def own_tty() -> str:
+    for fd in (0, 1, 2):
+        try:
+            return os.ttyname(fd)
+        except OSError:
+            pass
+    return ""
+
+
+def find_term(query: str, terms: list[Term]) -> Term:
+    q = query.lower()
+    exact = [t for t in terms if t.id.lower() == q]
+    if exact:
+        return exact[0]
+    hits = [t for t in terms if q in f"{t.id} {t.proc} {t.cwd} {t.name} {t.tty}".lower()]
+    mine = own_tty()
+    hits = [t for t in hits if t.tty != mine] or hits
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        raise SystemExit(red(f"No terminal matches '{query}'. Try --list."))
+    lines = "\n".join("  " + t.id + "  " + t.label() for t in hits)
+    raise SystemExit(red(f"'{query}' matches {len(hits)} terminals, use the id:\n") + lines)
+
+
+def term_exists(tid: str) -> bool:
+    try:
+        return any(t.id == tid for t in list_terms())
+    except Exception:
+        return False
+
+
+# ── firing ───────────────────────────────────────────────────────────────────
+def check_focus(tid: str) -> tuple[bool, bool]:
+    fr, ft = osa(CHECK_FOCUS_SCRIPT).split(SEP)
+    return fr == "true", ft == tid
+
+
+def focus(tid: str, tries: int = 3) -> bool:
+    for _ in range(tries):
+        osa(FOCUS_SCRIPT, tid)
+        time.sleep(0.35)
+        front, ours = check_focus(tid)
+        if front and ours:
+            return True
+    return False
+
+
+def fire(tid: str, text: str, mode: str, enter_ms: int, focus_only: bool = False) -> str:
+    """Return a result message. Raise RuntimeError on failure."""
+    if not term_exists(tid):
+        raise RuntimeError("the terminal is gone (did you close the tab?)")
+    focused = focus(tid)
+    if focus_only:
+        return "focus OK" if focused else "could not confirm focus"
+    if mode == "keystroke":
+        if not focused:
+            raise RuntimeError("could not confirm focus; not typing, to avoid typing into another window")
+        osa(KEYSTROKE_SCRIPT, text, str(enter_ms))
+        return "typed with System Events (focus OK)"
+    osa(PASTE_SCRIPT, tid, text, str(enter_ms))
+    return "sent to the terminal" + (
+        " (focus OK)" if focused else " (focus NOT confirmed, but the text goes straight to the terminal)"
+    )
+
+
+def notify(msg: str) -> None:
+    subprocess.run(
+        ["osascript", "-e", 'on run argv\ndisplay notification (item 1 of argv) with title "continua"\nend run', msg],
+        capture_output=True,
+    )
+
+
+# ── time ─────────────────────────────────────────────────────────────────────
+UNITS = {
+    "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600, "hora": 3600, "horas": 3600,
+    "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60, "minuto": 60, "minutos": 60,
+    "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1, "seg": 1, "segundo": 1, "segundos": 1,
+}
+
+
+def parse_when(s: str, now: dt.datetime | None = None) -> dt.datetime:
+    now = now or dt.datetime.now()
+    raw = s.strip().lower()
+    if raw in ("now", "0"):
+        return now
+    # clock time: 15:45, 3:45pm, 3:45 PM, 15:45:30, 3pm
+    m = re.fullmatch(r"(?:at\s+)?(\d{1,2})(?::(\d{2}))?(?::(\d{2}))?\s*([ap]\.?m\.?)?", raw)
+    if m and (m.group(2) or m.group(4)):
+        h, mi, se = int(m.group(1)), int(m.group(2) or 0), int(m.group(3) or 0)
+        ampm = (m.group(4) or "").replace(".", "")
+        if ampm and not 1 <= h <= 12:
+            raise ValueError("invalid time")
+        if ampm == "pm" and h < 12:
+            h += 12
+        if ampm == "am" and h == 12:
+            h = 0
+        if h > 23 or mi > 59 or se > 59:
+            raise ValueError("invalid time")
+        t = now.replace(hour=h, minute=mi, second=se, microsecond=0)
+        if t <= now:
+            t += dt.timedelta(days=1)
+        return t
+    # duration: 2h13m, +45m, in 2 hours 13 minutes, 90s, 45 (= minutes)
+    d = re.sub(r"^(\+|in\s+|en\s+)", "", raw)
+    d = d.replace(",", " ").replace(" and ", " ").replace(" y ", " ")
+    if re.fullmatch(r"\d+", d):
+        return now + dt.timedelta(minutes=int(d))
+    parts = re.findall(r"(\d+)\s*([a-z]+)", d)
+    if parts and re.fullmatch(r"(\s*\d+\s*[a-z]+\s*)+", d):
+        total = 0
+        for n, u in parts:
+            if u not in UNITS:
+                raise ValueError(f"unknown unit '{u}'")
+            total += int(n) * UNITS[u]
+        return now + dt.timedelta(seconds=total)
+    raise ValueError("format not recognized (e.g. 15:45, 3:45pm, +2h13m, 45m, 90s)")
+
+
+def fmt_left(sec: float) -> str:
+    sec = max(0, int(round(sec)))
+    h, r = divmod(sec, 3600)
+    m, s = divmod(r, 60)
+    return f"{h}h {m:02d}m {s:02d}s" if h else f"{m}m {s:02d}s"
+
+
+# ── TUI ──────────────────────────────────────────────────────────────────────
+AGENTS = ("codex", "claude")
+
+
+def ask(prompt: str, default: str | None = None) -> str:
+    try:
+        v = input(prompt).strip()
+    except EOFError:
+        raise SystemExit(0)
+    return v or (default or "")
+
+
+def pick_terminal() -> Term:
+    while True:
+        terms = list_terms()
+        if not terms:
+            raise SystemExit(red("Ghostty has no open terminals."))
+        mine = own_tty()
+        print(bold("\nGhostty terminals:\n"))
+        default = None
+        for i, t in enumerate(terms, 1):
+            tag = ""
+            if t.tty == mine:
+                tag = yellow("  ← this app")
+            elif any(a in t.proc.lower() for a in AGENTS):
+                tag = green(f"  ← {t.proc}")
+                if "codex" in t.proc.lower():
+                    default = default or str(i)
+            print(f"  {cyan(f'{i:>2}')}  {t.label()}{tag}")
+        hint = f" [{default}]" if default else ""
+        v = ask(f"\nWhich tab? number, or r to reload{hint}: ", default)
+        if v.lower() == "r":
+            continue
+        if v.isdigit() and 1 <= int(v) <= len(terms):
+            t = terms[int(v) - 1]
+            if t.tty == mine:
+                print(yellow("That is this app's own tab. Pick another one."))
+                continue
+            return t
+        print(red("Invalid number."))
+
+
+def ask_time(margin: int) -> dt.datetime:
+    while True:
+        v = ask("When? (15:45 · 3:45pm · +2h13m · 45m · 90s): ")
+        try:
+            t = parse_when(v) + dt.timedelta(seconds=margin)
+        except ValueError as e:
+            print(red(str(e)))
+            continue
+        print(f"→ fires at {bold(t.strftime('%H:%M:%S'))}"
+              + (f" {dim(f'(+{margin}s margin)')}" if margin else "")
+              + f", in {fmt_left((t - dt.datetime.now()).total_seconds())}")
+        return t
+
+
+class Keys:
+    """Put stdin in cbreak mode to read single keys while waiting."""
+
+    def __enter__(self):
+        self.fd = sys.stdin.fileno()
+        self.old = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        return self
+
+    def __exit__(self, *a):
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+
+    def get(self, timeout: float) -> str | None:
+        r, _, _ = select.select([sys.stdin], [], [], timeout)
+        return sys.stdin.read(1) if r else None
+
+
+def wait_loop(term: Term, target: dt.datetime | None, args) -> None:
+    log: list[str] = []
+    pending_test: float | None = None
+    done = False
+    last_check = 0.0
+    alive = True
+
+    def add(msg: str):
+        log.append(f"{dt.datetime.now():%H:%M:%S}  {msg}")
+        del log[:-8]
+
+    def do_fire(kind: str, focus_only=False):
+        try:
+            res = fire(term.id, args.text, args.mode, args.enter_ms, focus_only)
+            add(green(f"{kind}: {res}"))
+            return True
+        except Exception as e:  # noqa: BLE001
+            add(red(f"{kind}: ERROR: {e}"))
+            return False
+
+    def draw():
+        out = ["\033[H\033[2J", bold("continua") + dim("  · q or Ctrl+C quits and cancels\n")]
+        out.append(f"  Tab:   {term.label()}")
+        out.append(f"  Text:  {bold(repr(args.text))} + Enter   {dim(f'mode {args.mode}, Enter after {args.enter_ms} ms')}")
+        if not alive:
+            out.append(red("  ⚠ the terminal is gone"))
+        now = dt.datetime.now()
+        if done:
+            out.append(green(f"\n  ✔ Done at {target:%H:%M:%S}. Press c to set a new time."))
+        elif target:
+            out.append(f"\n  Fires at: {bold(target.strftime('%H:%M:%S'))}"
+                       + (dim(f" ({target:%Y-%m-%d})") if target.date() != now.date() else "")
+                       + f"   in {bold(fmt_left((target - now).total_seconds()))}")
+        else:
+            out.append(yellow("\n  No time set."))
+        if pending_test:
+            out.append(yellow(f"  Test in {fmt_left(pending_test - time.time())}: switch to another app to test focus"))
+        out.append(dim("\n  [t] test now  [5] test in 5 s  [0] test in 10 s  [f] focus only  [c] change time  [q] quit"))
+        if log:
+            out.append("\n" + "\n".join("  " + line for line in log))
+        sys.stdout.write("\n".join(out) + "\n")
+        sys.stdout.flush()
+
+    with Keys() as keys:
+        while True:
+            now_ts = time.time()
+            if now_ts - last_check > 30:
+                alive = term_exists(term.id)
+                last_check = now_ts
+            if pending_test and now_ts >= pending_test:
+                pending_test = None
+                do_fire("Test")
+            if target and not done and dt.datetime.now() >= target:
+                ok = do_fire("Fired")
+                done = True
+                notify(f"Sent '{args.text}' to tab {term.tab}" if ok else "Sending FAILED, check the app")
+                if args.exit_after:
+                    draw()
+                    return
+            draw()
+            k = keys.get(1.0 - (time.time() % 1.0) + 0.01)
+            if k is None:
+                continue
+            k = k.lower()
+            if k in ("q", "\x1b"):
+                return
+            if k == "t":
+                do_fire("Test")
+            elif k == "5":
+                pending_test = time.time() + 5
+            elif k == "0":
+                pending_test = time.time() + 10
+            elif k == "f":
+                do_fire("Focus", focus_only=True)
+            elif k in ("c", "n"):
+                termios.tcsetattr(keys.fd, termios.TCSADRAIN, keys.old)
+                try:
+                    print()
+                    target = ask_time(args.margin)
+                    done = False
+                finally:
+                    tty.setcbreak(keys.fd)
+
+
+# ── main ─────────────────────────────────────────────────────────────────────
+def main() -> None:
+    p = argparse.ArgumentParser(
+        prog="continua",
+        description="Type a message + Enter into a specific Ghostty tab at a set time.",
+    )
+    p.add_argument("-t", "--terminal", help="terminal id, or text to match (process, folder, title)")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--at", help="clock time: 15:45, 3:45pm")
+    g.add_argument("--in", dest="in_", help="duration: 2h13m, 45m, 90s")
+    p.add_argument("--text", default=DEFAULT_TEXT,
+                   help=f'text to type (default "{DEFAULT_TEXT}", or set CONTINUA_TEXT)')
+    p.add_argument("--mode", choices=["paste", "keystroke"], default="paste",
+                   help="paste: send straight to the terminal through Ghostty (default). "
+                        "keystroke: real key events through System Events")
+    p.add_argument("--enter-ms", type=int, default=400, help="pause between the text and Enter, in ms (default 400)")
+    p.add_argument("--margin", type=int, default=0, help="extra seconds after the given time (default 0)")
+    p.add_argument("--exit-after", action="store_true", help="exit after firing")
+    p.add_argument("--list", action="store_true", help="list terminals and exit")
+    p.add_argument("--test", action="store_true", help="fire right now and exit")
+    p.add_argument("--version", action="version", version=f"continua {__version__}")
+    args = p.parse_args()
+
+    if sys.platform != "darwin":
+        raise SystemExit("continua only works on macOS (it drives Ghostty through AppleScript).")
+
+    if args.list:
+        for t in list_terms():
+            print(f"{t.id}  {t.label()}")
+        return
+
+    term = find_term(args.terminal, list_terms()) if args.terminal else None
+
+    if args.test:
+        if not term:
+            raise SystemExit("--test needs --terminal")
+        print(fire(term.id, args.text, args.mode, args.enter_ms))
+        return
+
+    if not sys.stdin.isatty():
+        raise SystemExit("continua needs an interactive terminal (or use --test).")
+
+    term = term or pick_terminal()
+    when = args.at or args.in_
+    if when:
+        try:
+            target = parse_when(when) + dt.timedelta(seconds=args.margin)
+        except ValueError as e:
+            raise SystemExit(red(str(e)))
+    else:
+        target = ask_time(args.margin)
+
+    # Keep the Mac awake while we wait; caffeinate exits with us.
+    caf = subprocess.Popen(["caffeinate", "-is", "-w", str(os.getpid())],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        wait_loop(term, target, args)
+    finally:
+        caf.terminate()
+    print("\nBye.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        sys.exit(130)
